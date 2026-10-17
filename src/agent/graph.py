@@ -7,20 +7,13 @@ from src.tools.text_to_sql import query_operational_pipelines_db
 from src.tools.rag_docs import search_technical_runbooks
 from src.agent.memory import get_session_messages, add_message_to_session
 
-# # 1. Instancia o LLM da Groq
-# llm = ChatGroq(
-#     model="qwen/qwen3.8-27b",
-#     temperature=0.1,
-#     api_key=settings.groq_api_key
-# )
-
-
-# 1. Instancia o LLM da Groq com um modelo amplamente disponível
+# 1. Instancia o LLM da Groq
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="qwen/qwen3.8-27b",
     temperature=0.1,
     api_key=settings.groq_api_key
 )
+
 
 # 2. Dicionário e lista de ferramentas disponíveis
 tools_dict = {
