@@ -1,62 +1,98 @@
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
+import src.services.tracing
 from src.config import settings
 from src.tools.text_to_sql import query_operational_pipelines_db
 from src.tools.rag_docs import search_technical_runbooks
-from src.agent.memory import get_session_history
+from src.agent.memory import get_session_messages, add_message_to_session
 
-# 1. Instancia o LLM da Groq com o modelo especificado
+# # 1. Instancia o LLM da Groq
+# llm = ChatGroq(
+#     model="qwen/qwen3.8-27b",
+#     temperature=0.1,
+#     api_key=settings.groq_api_key
+# )
+
+
+# 1. Instancia o LLM da Groq com um modelo amplamente disponível
 llm = ChatGroq(
-    model="qwen/qwen3.8-27b",
+    model="llama-3.3-70b-versatile",
     temperature=0.1,
     api_key=settings.groq_api_key
 )
 
-# 2. Lista de ferramentas disponíveis para o Data Ops Copilot
-tools = [query_operational_pipelines_db, search_technical_runbooks]
+# 2. Dicionário e lista de ferramentas disponíveis
+tools_dict = {
+    "query_operational_pipelines_db": query_operational_pipelines_db,
+    "search_technical_runbooks": search_technical_runbooks
+}
+tools = list(tools_dict.values())
+llm_with_tools = llm.bind_tools(tools)
 
-# 3. Prompt do Sistema definindo a persona do Agente
+# 3. Prompt do Sistema direto e objetivo
 system_message = """
-Você é um Data Ops Copilot especialista em Engenharia de Dados, SRE e Operações de Plataforma.
-Sua missão é ajudar engenheiros a diagnosticar falhas em pipelines, analisar status de execuções via DuckDB (Text-to-SQL) 
-e consultar runbooks técnicos de documentação (RAG).
-
-Diretrizes:
-- Seja objetivo, técnico e direto ao ponto nas respostas.
-- Quando houver erro em pipelines, consulte os dados operacionais e cruze com os runbooks técnicos correspondentes para sugerir a ação corretiva exata.
-- Sempre valide se os resultados das consultas SQL retornaram dados antes de responder.
+Você é um Data Ops Copilot especialista em Engenharia de Dados e SRE. 
+Sua tarefa é ajudar engenheiros a diagnosticar falhas em pipelines consultando o banco de dados DuckDB (via ferramenta SQL) ou os runbooks (via RAG).
+Sempre analise os dados retornados pelas ferramentas e redija uma resposta final clara, técnica e explicativa em texto para o usuário.
 """
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_message),
-    MessagesPlaceholder(variable_name="chat_history"),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
 
-# 4. Criação do Agente com suporte a Tool Calling
-agent = create_tool_calling_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-# 5. Envolve o executor com histórico de mensagens baseado em session_id
-agent_with_chat_history = RunnableWithMessageHistory(
-    agent_executor,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="chat_history",
-)
-
-
-def run_agent_query(user_input: str, session_id: str) -> str:
-    """Executa a query do usuário no agente mantendo o contexto da sessão informada."""
-    config = {"configurable": {"session_id": session_id}}
+def run_agent_query(user_input: str, session_id: str, callbacks: list = None) -> str:
+    """Executa a query do usuário com loop de tool-calling e fallback forçado de texto."""
+    messages = get_session_messages(session_id)
     
-    response = agent_with_chat_history.invoke(
-        {"input": user_input},
-        config=config
-    )
-    
-    return response.get("output", "Desculpe, não consegui processar a resposta.")
+    # Constrói o histórico de mensagens
+    langchain_messages = [SystemMessage(content=system_message)]
+    for m in messages:
+        if m["role"] == "user":
+            langchain_messages.append(HumanMessage(content=m["content"]))
+        elif m["role"] == "assistant":
+            langchain_messages.append(AIMessage(content=m["content"]))
+            
+    langchain_messages.append(HumanMessage(content=user_input))
+    add_message_to_session(session_id, "user", user_input)
+
+    config = {}
+    if callbacks:
+        config["callbacks"] = callbacks
+
+    try:
+        answer = ""
+        # Loop controlado de tool-calling (até 3 iterações)
+        for _ in range(3):
+            response = llm_with_tools.invoke(langchain_messages, config=config)
+            
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                langchain_messages.append(response)
+                
+                for tc in response.tool_calls:
+                    tool_name = tc["name"]
+                    tool_args = tc["args"]
+                    tool_id = tc["id"]
+                    
+                    if tool_name in tools_dict:
+                        tool_fn = tools_dict[tool_name]
+                        tool_result = tool_fn.invoke(tool_args)
+                    else:
+                        tool_result = f"Erro: Ferramenta {tool_name} não encontrada."
+                        
+                    langchain_messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_id))
+            else:
+                answer = getattr(response, "content", "")
+                if answer.strip():
+                    break
+        
+        # Fallback de Segurança: Se o modelo executou as ferramentas mas não gerou texto,
+        # forçamos uma chamada final pedindo explicitamente o resumo técnico.
+        if not answer.strip():
+            fallback_prompt = HumanMessage(content="Com base nos dados retornados pelas ferramentas acima, forneça o diagnóstico técnico completo e a solução para o usuário.")
+            summary_response = llm.invoke(langchain_messages + [fallback_prompt], config=config)
+            answer = getattr(summary_response, "content", "Diagnóstico executado, mas não foi possível gerar o texto descritivo.")
+
+        # Salva e retorna
+        add_message_to_session(session_id, "assistant", answer)
+        return answer
+        
+    except Exception as e:
+        return f"Erro na execução do agente: {str(e)}"

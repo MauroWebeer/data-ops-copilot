@@ -1,13 +1,24 @@
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_community.chat_message_histories import ChatMessageHistory
-
-# Dicionário em memória para armazenar o histórico por session_id
-# Em produção, você poderia substituir facilmente por Redis ou PostgreSQL.
-store = {}
+# Dicionário em memória para armazenar o histórico de mensagens por session_id
+sessions_db = {}
+MAX_HISTORY_MESSAGES = 10  # Limita para evitar estouro de tokens
 
 
-def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    """Retorna ou cria o histórico de mensagens para uma sessão específica."""
-    if session_id not in store:
-        store[session_id] = ChatMessageHistory()
-    return store[session_id]
+def get_session_messages(session_id: str) -> list:
+    """Retorna a lista de mensagens da sessão aplicando uma janela deslizante (rolling window)."""
+    if session_id not in sessions_db:
+        sessions_db[session_id] = []
+    
+    # Retorna apenas as últimas mensagens para controlar o consumo de tokens
+    return sessions_db[session_id]
+
+
+def add_message_to_session(session_id: str, role: str, content: str):
+    """Adiciona uma mensagem e garante que o histórico não ultrapasse o limite."""
+    if session_id not in sessions_db:
+        sessions_db[session_id] = []
+        
+    sessions_db[session_id].append({"role": role, "content": content})
+    
+    # Se passar do limite, remove as mensagens mais antigas (preservando o contexto recente)
+    if len(sessions_db[session_id]) > MAX_HISTORY_MESSAGES:
+        sessions_db[session_id] = sessions_db[session_id][-MAX_HISTORY_MESSAGES:]
